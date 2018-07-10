@@ -10,8 +10,13 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 from torch.nn.parameter import Parameter
 from torch.nn.modules.loss import CrossEntropyLoss
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+
+allow_gpu = True
+if allow_gpu:
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+else:
+    device = torch.device('cpu')
 
 ##########################################################################
 ##########################################################################
@@ -21,6 +26,8 @@ def main():
     batch_size = 16
     data_dir = './data'
     max_num_epochs = 100
+    n_samples_per_img = 50
+    n_mixture_components = 3
 
     # Data retrieval
     train_loader, test_loader = load_mnist(data_dir,batch_size)
@@ -31,18 +38,29 @@ def main():
     gs = Graph_sampler(input_shape,
                        output_shape,
                        batch_size = batch_size,
-                       M = 2,
-                       num_sample = 25
+                       M = n_mixture_components,
+                       num_sample = n_samples_per_img
                       ).to(device).type(torch.float)
 
     # Run training optimization
     # params = gs.state_dict()
     # for param in params:
     #     print(param,params[param])
+    # print('--')
+    # # print(list(gs.parameters()))
+    #
     # sys.exit(0)
 
-    optimizer_classification = optim.Adam(gs.parameters(), lr=0.00003)
-    optimizer_reinforce = optim.Adam(gs.parameters(), lr=0.00003)
+    # for p in gs.named_parameters():
+    #     print(p)
+    # sys.exit(0)
+
+    targ_param_name = 'm_g_params'
+    c_params = [ p[1] for p in gs.named_parameters()
+                 if not p[0] == targ_param_name ]
+
+    optimizer_classification = optim.Adam(c_params, lr=0.0003)
+    optimizer_reinforce = optim.Adam([gs.m_g_params], lr=0.0003)
     ce_loss = CrossEntropyLoss()
     for epoch in range(max_num_epochs):
         loss_arr = []
@@ -56,14 +74,16 @@ def main():
 
             values, indices = torch.max(pred_output, 1)
             # print('IL',indices, label)
-            reward = torch.sum(indices == label)
+            reward = torch.sum(
+                        indices == label
+                    ).type(torch.cuda.FloatTensor) / batch_size
             # print(reward,len(label))
 
             # Note that this is equivalent to what used to be called multinomial
             m = Categorical(pred_output)
             action = m.sample()
-            loss = -m.log_prob(action) * reward.type(torch.cuda.FloatTensor)
-            loss = loss.sum() / batch_size # make invariant to changing batch_size
+            loss = -m.log_prob(action) * reward
+            loss = loss.sum() # make invariant to changing batch_size
 
             optimizer_classification.zero_grad()
             classification_loss.backward()
@@ -79,8 +99,8 @@ def main():
                 print('-'*30)
                 print("Epoch: " + str(epoch) + " batch: " + str(batch_idx) +
                       " Reward Avg: ",  mu_r, "CERR: " + str(mu_ce))
-                print('Params (sampler)\n', gs.m_g_params[0])
-                # print('Params (non-sampler)\n', gs.)
+                print('Params (sampler)\n', gs.m_g_params)
+                # print('Params (non-sampler)\n', c_params)
             #break
         print("Epoch" +  str(epoch) + "loss: ",
             np.mean(torch.stack(reward_arr).cpu().detach().numpy())
@@ -132,8 +152,10 @@ class GraphConvolution(nn.Module):
             self.bias.data.uniform_(-stdv, stdv)
 
     def forward(self, input, adj):
-        input = input.cuda()
+        # input = input.to(device).type(torch.cuda.FloatTensor) #input.cuda()
+        # adj = adj.to(device).type(torch.cuda.FloatTensor) #adj.cuda()
         adj = adj.cuda()
+        input = input.cuda()
         support = torch.matmul(input, self.weight)
         output = torch.matmul(adj, support)
         if self.bias is not None:
@@ -159,7 +181,7 @@ class GCN(nn.Module):
 ##########################################################################
 
 class Graph_sampler(nn.Module):
-    def __init__(self, input_shape, output_size, output=10, num_features=1,
+    def __init__(self, input_shape, output_size, output=10, num_features=3,
                  hidden_graph=100, M=10, num_sample=20, dropout=0.2,
                  batch_size=100):
         super(Graph_sampler, self).__init__()
@@ -170,17 +192,21 @@ class Graph_sampler(nn.Module):
         self.max_pooling = nn.MaxPool1d(20)
         self.fcf = nn.Linear(output*num_sample,output)
         self.output_gcn = output
+        self.M = M
         # Sampling parameters
         # There are M bivariate gaussian: Each bivariate gaussian has 5
         # parameters + vector M which contains the mixture weight
-        self.m_g_params = Parameter(torch.randn(6*M).to(device))
+        self.m_g_params = Parameter(torch.randn(1, 6*self.M).to(device))
 
     def forward(self, x):
-        self.params = torch.split(self.m_g_params, 6, 1)
-        self.params_mixture = torch.stack(self.params)
-        self.pi,self.mu_x,self.mu_y,self.sigma_x,self.sigma_y,self.rho_xy = torch.split(self.params_mixture,1,2)
+        self.sparams = torch.split(self.m_g_params.expand(
+                                        self.batch_size,6*self.M), 6, 1)
+        self.params_mixture = torch.stack(self.sparams)
+        (self.pi, self.mu_x, self.mu_y,
+         self.sigma_x, self.sigma_y,
+         self.rho_xy) = torch.split(self.params_mixture,1,2)
         self.pi = self.pi.squeeze().view(self.batch_size,-1)
-        self.pi = F.softmax(self.pi,dim=-1)
+        self.pi = F.softmax(self.pi, dim=-1)
         self.mu_x = self.mu_x.squeeze().view(self.batch_size,-1)
         self.mu_y = self.mu_y.squeeze().view(self.batch_size,-1)
         self.sigma_x =  self.sigma_x.squeeze().view(self.batch_size,-1)
@@ -190,11 +216,11 @@ class Graph_sampler(nn.Module):
         for i in range(self.num_sample):
             loc = self.sample_points()
             pixel_value = self.get_pixel_value(x,loc) #currently not doing bilinear interpolation
-            samples.append(pixel_value)
+            samples.append( torch.cat([pixel_value, loc], 1) )
             #break
         output = torch.stack(samples)
         # Vector of node features
-        feature_matrix = output.view(self.batch_size,self.num_sample, -1)
+        feature_matrix = output.view(self.batch_size, self.num_sample, -1)
         # Adjacency weight matrix
         adject_matrix = torch.ones(self.num_sample,self.num_sample)
         output = self.gcn(feature_matrix,adject_matrix)
