@@ -25,11 +25,11 @@ def main():
 
     #----------------------------------------------------------------#
     # Parameters
-    batch_size = 4
-    n_samples_per_img = 5
+    batch_size = 32
+    n_samples_per_img = 40
     reinforce_lr = 0.025
     classification_lr = 0.000125
-    graph_sig_size = 5
+    graph_sig_size = 25
 
     # Settings
     data_dir = './data'
@@ -237,6 +237,7 @@ class Graph_sampler(nn.Module):
         m = MultivariateNormal(mean, cov)
         x = m.sample()
         logprob = m.log_prob(x)
+        print('logprob',logprob)
         return F.tanh(x), logprob # Normalize it to -1 to 1 to get pixel value
 
     def get_pixel_value_single_img(self,x,locs,ind):
@@ -329,8 +330,15 @@ class GCNsig(nn.Module):
         g_out2 = F.dropout(g_out2, self.dropout, training=self.training)
 
         # print('g_out1', g_out1.size())
+        nanc1 = torch.isnan(g_out1).any()
+        if nanc1:
+            print('GOUT-1', g_out1)
+            sys.exit(0)
         # print('g_out2', g_out2.size())
-
+        nanc2 = torch.isnan(g_out2).any()
+        if nanc2:
+            print('GOUT-2', g_out2)
+            sys.exit(0)
         # print('C1',self.collapser1)
         # print('g_out2', g_out2)
 
@@ -345,6 +353,10 @@ class GCNsig(nn.Module):
         # Collapsed signature
         # Finally: sig in batch_size x sig_size
         sig = (g_out1 + g_out2).sum(dim=2)
+        nansig = torch.isnan(sig).any()
+        if nansig:
+            print('Signan', sig)
+            sys.exit(0)
 
         # print('sig', sig.size())
         print('SIG', sig)
