@@ -25,11 +25,12 @@ def main():
 
     #----------------------------------------------------------------#
     # Parameters
-    batch_size = 32
-    n_samples_per_img = 40
-    reinforce_lr = 0.025
-    classification_lr = 0.000125
-    graph_sig_size = 25
+    batch_size = 64
+    n_samples_per_img = 75
+    reinforce_lr = 0.15
+    classification_lr = 0.000225
+    graph_sig_size = 100
+    hidden_gnn_size = 75
 
     # Settings
     data_dir = './data'
@@ -37,7 +38,6 @@ def main():
     n_mixture_components = 2
     reward_type = 2 # 1 = negative CE_loss, 2 = 0-1 correctness
     #----------------------------------------------------------------#
-
 
     # Data retrieval
     train_loader, test_loader = load_mnist(data_dir,batch_size)
@@ -50,6 +50,7 @@ def main():
                        batch_size = batch_size,
                        M = n_mixture_components,
                        num_sample = n_samples_per_img,
+                       hidden_graph = hidden_gnn_size,
                        sig_size = graph_sig_size
                       ).to(device).type(torch.float)
 
@@ -65,6 +66,7 @@ def main():
     optimizer_classification = optim.Adam(c_params, lr=classification_lr)
     optimizer_reinforce = optim.Adam([gs.m_g_params], lr=reinforce_lr)
     ce_loss = CrossEntropyLoss(reduce=False)
+    print('Starting Training')
     for epoch in range(max_num_epochs):
         loss_arr = []
         reward_arr = []
@@ -76,15 +78,12 @@ def main():
             pred_output, logprob = gs.forward(data.to(device).type(torch.float))
             ### Get classification loss for all differentiable parts of the network ###
             classification_losses = ce_loss(pred_output, label)
-            classification_loss = classification_losses.mean() # Note reduce=False
+            classification_loss = classification_losses.mean() # Note reduce=False above
             ### Get REINFORCE loss to train the sampler ###
             values, indices = torch.max(pred_output, 1)
-            # Actual reward value
+            # Actual reward value (averaging and baseline as well)
             rewards = rewardf(indices, label, classification_losses).detach()
-            #
-            print('\tR=',rewards.sum())
-            #
-            rloss = (-logprob * rewards / batch_size).sum()
+            rloss = (-logprob * (rewards - rewards.mean()) / batch_size).sum()
 
             ### Backprop training for differentiable network components ###
             optimizer_classification.zero_grad()
@@ -101,13 +100,17 @@ def main():
             reward_arr.append(rewards)
             ce_loss_arr.append(classification_loss)
 
-            if(batch_idx % 5 == True):
+            if(batch_idx % 5 == 0):
                 mu_r = np.mean(torch.stack(reward_arr).cpu().detach().numpy())
                 mu_ce = np.mean(torch.stack(ce_loss_arr).cpu().detach().numpy())
                 print('-'*30)
                 print("Epoch: " + str(epoch) + " batch: " + str(batch_idx) +
                       " Reward Avg: ",  mu_r, "CERR: " + str(mu_ce))
-                print('Params (sampler)\n', gs.m_g_params)
+                print('Params (sampler)\n', gs.m_g_params.data.cpu().detach().numpy())
+                print('-'*30)
+            # Always print the reward from the current batch
+            print('\t(B%d) R =' % batch_idx, rewards.sum().cpu().detach().numpy())
+
                 # print('Params (non-sampler)\n', c_params)
             #break
         print("Epoch" +  str(epoch) + "rewards: ",
@@ -162,6 +165,7 @@ class Graph_sampler(nn.Module):
         # Parameters for similarity (inverse distance) weighted adjacency
         self.alpha = 1.0
         self.beta = 0.5
+        print('Built Sampler')
 
     def forward(self, x):
         self.sparams = torch.split(self.m_g_params.expand(
@@ -237,7 +241,7 @@ class Graph_sampler(nn.Module):
         m = MultivariateNormal(mean, cov)
         x = m.sample()
         logprob = m.log_prob(x)
-        print('logprob',logprob)
+        # print('logprob',logprob)
         return F.tanh(x), logprob # Normalize it to -1 to 1 to get pixel value
 
     def get_pixel_value_single_img(self,x,locs,ind):
@@ -314,7 +318,7 @@ class GCNsig(nn.Module):
         self.collapser1 = Parameter(torch.randn(sig_size, n_samples))
         self.collapser2 = Parameter(torch.randn(sig_size, n_samples))
         self.dropout = dropout
-        self.softmax = nn.Softmax()
+        self.softmax = nn.Softmax(dim=1)
 
     def forward_sig(self, x, adj):
         # print('adj', adj.size())
@@ -330,15 +334,15 @@ class GCNsig(nn.Module):
         g_out2 = F.dropout(g_out2, self.dropout, training=self.training)
 
         # print('g_out1', g_out1.size())
-        nanc1 = torch.isnan(g_out1).any()
-        if nanc1:
-            print('GOUT-1', g_out1)
-            sys.exit(0)
+        # nanc1 = torch.isnan(g_out1).any()
+        # if nanc1:
+        #     print('GOUT-1', g_out1)
+        #     sys.exit(0)
         # print('g_out2', g_out2.size())
-        nanc2 = torch.isnan(g_out2).any()
-        if nanc2:
-            print('GOUT-2', g_out2)
-            sys.exit(0)
+        # nanc2 = torch.isnan(g_out2).any()
+        # if nanc2:
+        #     print('GOUT-2', g_out2)
+        #     sys.exit(0)
         # print('C1',self.collapser1)
         # print('g_out2', g_out2)
 
@@ -353,15 +357,15 @@ class GCNsig(nn.Module):
         # Collapsed signature
         # Finally: sig in batch_size x sig_size
         sig = (g_out1 + g_out2).sum(dim=2)
-        nansig = torch.isnan(sig).any()
-        if nansig:
-            print('Signan', sig)
-            print('C1', self.collapser1)
-            print('C2', self.collapser2)
-            sys.exit(0)
+        # nansig = torch.isnan(sig).any()
+        # if nansig:
+        #     print('Signan', sig)
+        #     print('C1', self.collapser1)
+        #     print('C2', self.collapser2)
+        #     sys.exit(0)
 
         # print('sig', sig.size())
-        print('SIG', sig)
+        # print('SIG', sig)
         # TODO randomly the sig is NAN (?!)
         return sig
 
