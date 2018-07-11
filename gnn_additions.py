@@ -23,16 +23,21 @@ else:
 ##########################################################################
 def main():
 
-    # Settings
-    batch_size = 32
-    data_dir = './data'
-    max_num_epochs = 100
-    n_samples_per_img = 40
-    n_mixture_components = 2
-    reward_type = 2 # 1 = negative CE_loss, 2 = 0-1 correctness
+    #----------------------------------------------------------------#
+    # Parameters
+    batch_size = 4
+    n_samples_per_img = 5
     reinforce_lr = 0.025
     classification_lr = 0.000125
-    graph_sig_size = 25
+    graph_sig_size = 5
+
+    # Settings
+    data_dir = './data'
+    max_num_epochs = 100
+    n_mixture_components = 2
+    reward_type = 2 # 1 = negative CE_loss, 2 = 0-1 correctness
+    #----------------------------------------------------------------#
+
 
     # Data retrieval
     train_loader, test_loader = load_mnist(data_dir,batch_size)
@@ -154,34 +159,48 @@ class Graph_sampler(nn.Module):
         # There are M bivariate gaussian: Each bivariate gaussian has 5
         # parameters + vector M which contains the mixture weight
         self.m_g_params = Parameter(torch.randn(1, 6*self.M).to(device))
+        # Parameters for similarity (inverse distance) weighted adjacency
+        self.alpha = 1.0
+        self.beta = 0.5
 
     def forward(self, x):
         self.sparams = torch.split(self.m_g_params.expand(
-                                        self.batch_size,6*self.M), 6, 1)
+                                        self.num_sample,6*self.M), 6, 1)
         self.params_mixture = torch.stack(self.sparams)
         (self.pi, self.mu_x, self.mu_y,
          self.sigma_x, self.sigma_y,
          self.rho_xy) = torch.split(self.params_mixture,1,2)
-        self.pi = self.pi.squeeze().view(self.batch_size,-1)
+        self.pi = self.pi.squeeze().view(self.num_sample,-1)
         self.pi = F.softmax(self.pi, dim=-1)
-        self.mu_x = self.mu_x.squeeze().view(self.batch_size,-1)
-        self.mu_y = self.mu_y.squeeze().view(self.batch_size,-1)
-        self.sigma_x =  self.sigma_x.squeeze().view(self.batch_size,-1)
-        self.sigma_y =  self.sigma_y.squeeze().view(self.batch_size,-1)
-        self.rho_xy =  self.rho_xy.squeeze().view(self.batch_size,-1)
-        samples = []
+        self.mu_x = self.mu_x.squeeze().view(self.num_sample,-1)
+        self.mu_y = self.mu_y.squeeze().view(self.num_sample,-1)
+        self.sigma_x =  self.sigma_x.squeeze().view(self.num_sample,-1)
+        self.sigma_y =  self.sigma_y.squeeze().view(self.num_sample,-1)
+        self.rho_xy =  self.rho_xy.squeeze().view(self.num_sample,-1)
+        samples, adj_mats = [], []
         full_log_prob = Variable(torch.zeros(self.batch_size), requires_grad=True).to(device)
-        for i in range(self.num_sample):
-            loc, logprob = self.sample_points()
-            pixel_value = self.get_pixel_value(x,loc)
+        for i in range(self.batch_size):
+            loc, logprob, adj_mat = self.sample_points()
+            pixel_value = self.get_pixel_value_single_img(x,loc,i)
+            # print("xs",x.size())
+            # print("locs",loc.size())
+            # print("logprobs",logprob.size())
+            # print("adjmat",adj_mat.size())
+            # print("pval",pixel_value.size()) # n_samples x 1
             samples.append( torch.cat([pixel_value, loc], 1) )
-            full_log_prob = full_log_prob + logprob
+            # full_log_prob = full_log_prob + logprob <-- across samples
+            full_log_prob[i] = logprob.sum() # sum logprobs over samples to get log prob for a single batch member
+            adj_mats.append(adj_mat)
             #break
-        output = torch.stack(samples)
+        output = torch.stack(samples) # TODO does this stack and view (below) do the right thing?
+        sim_mat = torch.stack(adj_mats)
+        # print(sim_mat.size()) # batch_size x n_samples x n_samples
+        # print(output.size()) # batch_size x n_samples x n_features
         # Vector of node features
         feature_matrix = output.view(self.batch_size, self.num_sample, -1)
         # Adjacency weight matrix
-        adject_matrix = torch.ones(self.num_sample, self.num_sample)
+        #adject_matrix = torch.ones(self.num_sample, self.num_sample)
+        adject_matrix = sim_mat
         output = self.gcn.forward_sig(feature_matrix, adject_matrix)
         output = output.view(self.batch_size,  self.sig_size)
         output = F.softmax(self.fcf(output), dim=-1)
@@ -199,7 +218,15 @@ class Graph_sampler(nn.Module):
         sigma_y = torch.exp(torch.gather(self.sigma_y,1,pi_idx))
         rho_xy = torch.tanh(torch.gather(self.rho_xy,1,pi_idx))
         loc, logprob =  self.sample_bivariate_normal(mu_x,mu_y,sigma_x,sigma_y,rho_xy, greedy=False)
-        return loc, logprob
+
+        # print("locs",loc.size())
+
+        # Compute distance-weighted adjacency matrix
+        # loc is n_samples x 2
+        P_tilde = loc.expand(self.num_sample, self.num_sample, 2)
+        D_unnorm_sq = ( P_tilde - P_tilde.transpose(0,1) ).pow(2).sum(dim=2)
+        D_sim_sq = 1.0 / (self.alpha + self.beta * D_unnorm_sq)
+        return loc, logprob, D_sim_sq
 
     def sample_bivariate_normal(self, mu_x,mu_y,sigma_x,sigma_y,rho_xy, greedy=False):
         if greedy: return mu_x, mu_y
@@ -212,7 +239,21 @@ class Graph_sampler(nn.Module):
         logprob = m.log_prob(x)
         return F.tanh(x), logprob # Normalize it to -1 to 1 to get pixel value
 
-    def get_pixel_value(self,x,loc):
+    def get_pixel_value_single_img(self,x,locs,ind):
+        B, C, H, W = x.shape
+        denorm_locs = self.denormalize(H, locs) #height and width are same
+        #denorm_loc =torch.split(denorm_loc.unsqueeze(1),1,2)
+        # print('denorm_locs', denorm_locs.size())
+        pixel_features = []
+        targ_img = x[ind,:,:,:]
+        for i,loc in enumerate(denorm_locs):
+            pixel_value = targ_img[:,loc[0],loc[1]]
+            pixel_features.append(pixel_value)
+        pixel_features = torch.stack(pixel_features)
+        # print('pixfeats', pixel_features.size())
+        return pixel_features
+
+    def get_pixel_value_across_images(self,x,loc):
         B, C, H, W = x.shape
         denorm_loc = self.denormalize(H, loc) #height and width are same
         #denorm_loc =torch.split(denorm_loc.unsqueeze(1),1,2)
@@ -306,7 +347,7 @@ class GCNsig(nn.Module):
         sig = (g_out1 + g_out2).sum(dim=2)
 
         # print('sig', sig.size())
-        # print('SIG', sig)
+        print('SIG', sig)
         # TODO randomly the sig is NAN (?!)
         return sig
 
