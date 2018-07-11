@@ -26,17 +26,18 @@ def main():
     #----------------------------------------------------------------#
     # Parameters
     batch_size = 64
-    n_samples_per_img = 75
+    n_samples_per_img = 100
     reinforce_lr = 0.15
-    classification_lr = 0.000225
-    graph_sig_size = 100
-    hidden_gnn_size = 75
+    classification_lr = 0.00225
+    graph_sig_size = 128
+    hidden_gnn_size = 128
 
     # Settings
     data_dir = './data'
     max_num_epochs = 100
     n_mixture_components = 2
     reward_type = 2 # 1 = negative CE_loss, 2 = 0-1 correctness
+    avg_update_every = 10
     #----------------------------------------------------------------#
 
     # Data retrieval
@@ -77,10 +78,13 @@ def main():
             ### Run network forward pass on batch ###
             pred_output, logprob = gs.forward(data.to(device).type(torch.float))
             ### Get classification loss for all differentiable parts of the network ###
+            print('label',label)
+            # print('pred_output',pred_output)
             classification_losses = ce_loss(pred_output, label)
             classification_loss = classification_losses.mean() # Note reduce=False above
             ### Get REINFORCE loss to train the sampler ###
             values, indices = torch.max(pred_output, 1)
+            print('inds', indices)
             # Actual reward value (averaging and baseline as well)
             rewards = rewardf(indices, label, classification_losses).detach()
             rloss = (-logprob * (rewards - rewards.mean()) / batch_size).sum()
@@ -100,7 +104,7 @@ def main():
             reward_arr.append(rewards)
             ce_loss_arr.append(classification_loss)
 
-            if(batch_idx % 5 == 0):
+            if(batch_idx % avg_update_every == 0):
                 mu_r = np.mean(torch.stack(reward_arr).cpu().detach().numpy())
                 mu_ce = np.mean(torch.stack(ce_loss_arr).cpu().detach().numpy())
                 print('-'*30)
@@ -211,17 +215,21 @@ class Graph_sampler(nn.Module):
         #output = self.max_pooling(output)
         return output.squeeze(-1), full_log_prob
 
-    def sample_points(self):
+    def sample_points(self,uniform=True):
         # Can do reparametrization trick: https://arxiv.org/abs/1607.05690
-        m = Categorical(self.pi)
-        pi_idx = m.sample().to(device)
-        pi_idx = pi_idx.view(-1,1)
-        mu_x = torch.gather(self.mu_x,1,pi_idx)
-        mu_y = torch.gather(self.mu_y,1,pi_idx)
-        sigma_x = torch.exp(torch.gather(self.sigma_x,1,pi_idx))
-        sigma_y = torch.exp(torch.gather(self.sigma_y,1,pi_idx))
-        rho_xy = torch.tanh(torch.gather(self.rho_xy,1,pi_idx))
-        loc, logprob =  self.sample_bivariate_normal(mu_x,mu_y,sigma_x,sigma_y,rho_xy, greedy=False)
+        if uniform:
+            loc = 2.0 * torch.rand(self.num_sample,2).to(device) - 1
+            logprob = -2.0 * torch.ones(self.num_sample).to(device)
+        else:
+            m = Categorical(self.pi)
+            pi_idx = m.sample().to(device)
+            pi_idx = pi_idx.view(-1,1)
+            mu_x = torch.gather(self.mu_x,1,pi_idx)
+            mu_y = torch.gather(self.mu_y,1,pi_idx)
+            sigma_x = torch.exp(torch.gather(self.sigma_x,1,pi_idx))
+            sigma_y = torch.exp(torch.gather(self.sigma_y,1,pi_idx))
+            rho_xy = torch.tanh(torch.gather(self.rho_xy,1,pi_idx))
+            loc, logprob =  self.sample_bivariate_normal(mu_x,mu_y,sigma_x,sigma_y,rho_xy, greedy=False)
 
         # print("locs",loc.size())
 
