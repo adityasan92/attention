@@ -24,14 +24,15 @@ else:
 def main():
 
     # Settings
-    batch_size = 64
+    batch_size = 32
     data_dir = './data'
     max_num_epochs = 100
-    n_samples_per_img = 25
+    n_samples_per_img = 40
     n_mixture_components = 2
     reward_type = 2 # 1 = negative CE_loss, 2 = 0-1 correctness
-    reinforce_lr = 0.25
-    classification_lr = 0.0001
+    reinforce_lr = 0.025
+    classification_lr = 0.000125
+    graph_sig_size = 25
 
     # Data retrieval
     train_loader, test_loader = load_mnist(data_dir,batch_size)
@@ -43,7 +44,8 @@ def main():
                        output_shape,
                        batch_size = batch_size,
                        M = n_mixture_components,
-                       num_sample = n_samples_per_img
+                       num_sample = n_samples_per_img,
+                       sig_size = graph_sig_size
                       ).to(device).type(torch.float)
 
     if reward_type == 1:
@@ -75,7 +77,7 @@ def main():
             # Actual reward value
             rewards = rewardf(indices, label, classification_losses).detach()
             #
-            # print('b',rewards)
+            print('\tR=',rewards.sum())
             #
             rloss = (-logprob * rewards / batch_size).sum()
 
@@ -133,14 +135,19 @@ def load_mnist(data_dir,batch_size):
 class Graph_sampler(nn.Module):
     def __init__(self, input_shape, output_size, output=10, num_features=3,
                  hidden_graph=100, M=10, num_sample=20, dropout=0.2,
-                 batch_size=100):
+                 batch_size=100, sig_size=100):
         super(Graph_sampler, self).__init__()
 
         self.batch_size = batch_size
         self.num_sample = num_sample
-        self.gcn = GCN(num_features, hidden_graph, output, dropout).to(device).type(torch.float)
+        self.sig_size = sig_size
+        # self, nfeat, nhid, sig_size, n_samples, dropout
+        self.gcn = GCNsig(
+                    num_features, hidden_graph, sig_size,
+                    num_sample, dropout
+                    ).to(device).type(torch.float)
         self.max_pooling = nn.MaxPool1d(20)
-        self.fcf = nn.Linear(output*num_sample, output)
+        self.fcf = nn.Linear(sig_size, output)
         self.output_gcn = output
         self.M = M
         # Sampling parameters
@@ -175,8 +182,8 @@ class Graph_sampler(nn.Module):
         feature_matrix = output.view(self.batch_size, self.num_sample, -1)
         # Adjacency weight matrix
         adject_matrix = torch.ones(self.num_sample, self.num_sample)
-        output = self.gcn(feature_matrix,adject_matrix)
-        output = output.view(self.batch_size,  self.output_gcn*self.num_sample)
+        output = self.gcn.forward_sig(feature_matrix, adject_matrix)
+        output = output.view(self.batch_size,  self.sig_size)
         output = F.softmax(self.fcf(output), dim=-1)
         #output = self.max_pooling(output)
         return output.squeeze(-1), full_log_prob
@@ -257,6 +264,54 @@ class GraphConvolution(nn.Module):
 
 ##########################################################################
 
+class GCNsig(nn.Module):
+    def __init__(self, nfeat, nhid, sig_size, n_samples, dropout):
+        super(GCNsig, self).__init__()
+        self.gc1 = GraphConvolution(nfeat, nhid).to(device).type(torch.float)
+        self.gc2 = GraphConvolution(nhid, nhid).to(device).type(torch.float)
+        self.collapser1 = Parameter(torch.Tensor(sig_size, n_samples))
+        self.collapser2 = Parameter(torch.Tensor(sig_size, n_samples))
+        self.dropout = dropout
+        self.softmax = nn.Softmax()
+
+    def forward_sig(self, x, adj):
+        # print('adj', adj.size())
+        # print('x',x.size())
+
+        # Run input graph (node feat & adj matrices)
+        # Note: x in batch_size x n_samples x node_feats
+        #       adj in n_samples x n_samples # <------- TODO by batch-size?!
+        #       g_out in batch_size x n_samples x n_hidden_feats
+        g_out1 = F.relu(self.gc1(x, adj))
+        g_out1 = F.dropout(g_out1, self.dropout, training=self.training)
+        g_out2 = F.relu(self.gc2(g_out1, adj))
+        g_out2 = F.dropout(g_out2, self.dropout, training=self.training)
+
+        # print('g_out1', g_out1.size())
+        # print('g_out2', g_out2.size())
+
+        # print('C1',self.collapser1)
+        # print('g_out2', g_out2)
+
+        # Collapse to a signature over the graph (linear transform)
+        # Now: g_out in batch_size x n_samples x n_hidden_feats
+        g_out1 = self.softmax( torch.matmul(self.collapser1, g_out1) )
+        g_out2 = self.softmax( torch.matmul(self.collapser2, g_out2) )
+
+        # print('g_out1c', g_out1.size())
+        # print('g_out2c', g_out2.size())
+
+        # Collapsed signature
+        # Finally: sig in batch_size x sig_size
+        sig = (g_out1 + g_out2).sum(dim=2)
+
+        # print('sig', sig.size())
+        # print('SIG', sig)
+        # TODO randomly the sig is NAN (?!)
+        return sig
+
+##########################################################################
+
 class GCN(nn.Module):
     def __init__(self, nfeat, nhid, nclass, dropout):
         super(GCN, self).__init__()
@@ -270,6 +325,19 @@ class GCN(nn.Module):
         x = self.gc2(x, adj)
         return F.log_softmax(x)
 
+    def forward_sig(self, x, adj):
+        # x in batch_size x n_samples x node_feats
+        # g_out1 in batch_size x n_samples x g_hidden_size
+        # g_out2 in batch_size x n_samples x nclass
+        g_out1 = F.relu(self.gc1(x, adj))
+        g_out1 = F.dropout(g_out1, self.dropout, training=self.training)
+        g_out2 = F.relu(self.gc2(g_out1, adj))
+        g_out2 = F.dropout(g_out2, self.dropout, training=self.training)
+
+        print('x',x.size())
+        print('g_out1', g_out1.size())
+        print('g_out2', g_out2.size())
+        sys.exit(0)
 
 ##########################################################################
 ##########################################################################
