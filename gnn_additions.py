@@ -279,9 +279,9 @@ class GraphConvolution(nn.Module):
         super(GraphConvolution, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = Parameter(torch.FloatTensor(in_features, out_features))
+        self.weight = Parameter(torch.randn(in_features, out_features))
         if bias:
-            self.bias = Parameter(torch.FloatTensor(out_features))
+            self.bias = Parameter(torch.randn(out_features))
         else:
             self.register_parameter('bias', None)
         self.reset_parameters()
@@ -311,8 +311,8 @@ class GCNsig(nn.Module):
         super(GCNsig, self).__init__()
         self.gc1 = GraphConvolution(nfeat, nhid).to(device).type(torch.float)
         self.gc2 = GraphConvolution(nhid, nhid).to(device).type(torch.float)
-        self.collapser1 = Parameter(torch.Tensor(sig_size, n_samples))
-        self.collapser2 = Parameter(torch.Tensor(sig_size, n_samples))
+        self.collapser1 = Parameter(torch.randn(sig_size, n_samples))
+        self.collapser2 = Parameter(torch.randn(sig_size, n_samples))
         self.dropout = dropout
         self.softmax = nn.Softmax()
 
@@ -356,6 +356,8 @@ class GCNsig(nn.Module):
         nansig = torch.isnan(sig).any()
         if nansig:
             print('Signan', sig)
+            print('C1', self.collapser1)
+            print('C2', self.collapser2)
             sys.exit(0)
 
         # print('sig', sig.size())
