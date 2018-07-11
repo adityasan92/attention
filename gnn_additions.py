@@ -21,7 +21,6 @@ else:
 
 ##########################################################################
 ##########################################################################
-# Bayesian hard attention via stochastic graph sampling
 def main():
 
     # Settings
@@ -31,8 +30,8 @@ def main():
     n_samples_per_img = 25
     n_mixture_components = 2
     reward_type = 2 # 1 = negative CE_loss, 2 = 0-1 correctness
-    reinforce_lr = 0.005
-    classification_lr = 0.000001
+    reinforce_lr = 0.25
+    classification_lr = 0.0001
 
     # Data retrieval
     train_loader, test_loader = load_mnist(data_dir,batch_size)
@@ -47,23 +46,10 @@ def main():
                        num_sample = n_samples_per_img
                       ).to(device).type(torch.float)
 
-    # Run training optimization
-    # params = gs.state_dict()
-    # for param in params:
-    #     print(param,params[param])
-    # print('--')
-    # # print(list(gs.parameters()))
-    #
-    # sys.exit(0)
-
-    # for p in gs.named_parameters():
-    #     print(p)
-    # sys.exit(0)
-
     if reward_type == 1:
         rewardf = lambda i,l,cl: -cl
     elif reward_type == 2:
-        rewardf = lambda i,l,cl: i == l
+        rewardf = lambda i,l,cl: (i == l).type(torch.cuda.FloatTensor)
 
     targ_param_name = 'm_g_params'
     c_params = [ p[1] for p in gs.named_parameters()
@@ -77,44 +63,21 @@ def main():
         reward_arr = []
         ce_loss_arr = []
         for batch_idx, (data, label) in enumerate(train_loader):
-
             ### Retrieve true label ###
             label = label.to(device).type(torch.cuda.LongTensor)
-
             ### Run network forward pass on batch ###
             pred_output, logprob = gs.forward(data.to(device).type(torch.float))
-
             ### Get classification loss for all differentiable parts of the network ###
             classification_losses = ce_loss(pred_output, label)
-            classification_loss = classification_losses.mean()
-
+            classification_loss = classification_losses.mean() # Note reduce=False
             ### Get REINFORCE loss to train the sampler ###
             values, indices = torch.max(pred_output, 1)
-            # print('IL',indices, label)
-            # reward = torch.sum(
-            #             indices == label
-            #         ).type(torch.cuda.FloatTensor) / batch_size
-            rewards = rewardf(indices, label, classification_losses).type(
-                              torch.cuda.FloatTensor)
-            # print(reward,len(label))
-
-            # r1: 0-1
-            # r2: -ce_loss
-
-
-            # print('a',indices == label)
-            print('b',rewards)
-            # print('logprob',logprob)
-            # print('c',classification_loss)
-            # sys.exit(0)
-
+            # Actual reward value
+            rewards = rewardf(indices, label, classification_losses).detach()
+            #
+            # print('b',rewards)
+            #
             rloss = (-logprob * rewards / batch_size).sum()
-
-            # Note that this is equivalent to what used to be called multinomial
-            # m = Categorical(pred_output)
-            # action = m.sample()
-            # loss = -m.log_prob(action) * reward
-            # loss = loss.sum() # make invariant to changing batch_size
 
             ### Backprop training for differentiable network components ###
             optimizer_classification.zero_grad()
@@ -205,7 +168,6 @@ class Graph_sampler(nn.Module):
             loc, logprob = self.sample_points()
             pixel_value = self.get_pixel_value(x,loc)
             samples.append( torch.cat([pixel_value, loc], 1) )
-            #logprobs.append(logprob)
             full_log_prob = full_log_prob + logprob
             #break
         output = torch.stack(samples)
@@ -315,5 +277,6 @@ if __name__ == '__main__': main()
 ##########################################################################
 ##########################################################################
 
+### Bayesian hard attention via stochastic graph sampling ###
 # conda create -n attn python=3.6 scipy pytorch torchvision
 # source activate attn
